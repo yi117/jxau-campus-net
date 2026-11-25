@@ -19,7 +19,9 @@ param(
     [switch]$Phase2,
     [string]$Owner = '',
     [string]$RuntimeDir = '',
-    [switch]$SkipPrompt
+    [switch]$SkipPrompt,
+    [switch]$NonInteractive,
+    [switch]$NoPortalPolicy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -144,7 +146,7 @@ if ($Owner -and $Owner -ne $currentUser) {
     Write-Host ''
     Write-Host ("当前是以 {0} 身份运行的，和目标用户 {1} 不一致。" -f $currentUser, $Owner) -ForegroundColor Red
     Write-Host '多半是 UAC 里用别的管理员账号授权了。请用当前登录账户亲自完成 UAC 确认后重试。'
-    if ($Host.Name -eq 'ConsoleHost') { Read-Host '按回车关闭' | Out-Null }
+    if ($Host.Name -eq 'ConsoleHost' -and -not $NonInteractive) { Read-Host '按回车关闭' | Out-Null }
     return
 }
 
@@ -241,9 +243,32 @@ if ($registered) {
     Write-Host ("守护脚本：{0}" -f $guardPath)
 }
 
+# ---- 关掉"连上需要登录的网络就自动打开浏览器"
+# 开机那几十秒守护进程还没登好，Windows 的强制门户检测会抢先拉起浏览器。
+# 这两个策略只拦"自动打开浏览器"这一个动作，通知和手动打开认证页都不受影响。
+if (-not $NoPortalPolicy) {
+    $wcmKey  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WcmSvc\GroupPolicy'
+    $ncsiKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator'
+    try {
+        if (-not (Test-Path -LiteralPath $wcmKey)) { New-Item -Path $wcmKey -Force | Out-Null }
+        New-ItemProperty -LiteralPath $wcmKey -Name 'fBlockWebBrowserLaunch' -Value 1 -PropertyType DWord -Force | Out-Null
+        if (-not (Test-Path -LiteralPath $ncsiKey)) { New-Item -Path $ncsiKey -Force | Out-Null }
+        New-ItemProperty -LiteralPath $ncsiKey -Name 'NoWebBrowserLaunch' -Value 1 -PropertyType DWord -Force | Out-Null
+        Write-Host '已关闭开机自动弹认证页（Windows 不会再自己拉起浏览器）' -ForegroundColor Green
+    } catch {
+        Write-Host ("关闭自动弹认证页失败：{0}" -f $_.Exception.Message) -ForegroundColor Yellow
+        Write-Host '可以稍后手动双击 no-portal-popup.cmd。'
+    }
+}
+
 Start-ScheduledTask -TaskName $taskName
-Write-Host '已启动守护进程，等它跑一轮...'
-Start-Sleep -Seconds 10
+if ($NonInteractive) {
+    # 界面调用时不要挂着等，给守护进程两秒把 state.json 写出来就够
+    Start-Sleep -Seconds 2
+} else {
+    Write-Host '已启动守护进程，等它跑一轮...'
+    Start-Sleep -Seconds 10
+}
 
 # 打印状态
 $statusScript = Join-Path $here 'status.ps1'
@@ -263,6 +288,6 @@ Write-Host '查看状态：双击 status.cmd'
 Write-Host '卸载：双击 uninstall.cmd'
 Write-Host ''
 Write-Host '建议顺手做一步：双击 tune-wifi.cmd，关掉网卡的省电断开（需要 UAC）。'
-if ($Host.Name -eq 'ConsoleHost') {
+if ($Host.Name -eq 'ConsoleHost' -and -not $NonInteractive) {
     Read-Host '按回车关闭这个窗口' | Out-Null
 }
