@@ -23,6 +23,8 @@ param(
     [switch]$SelfTest,
     [switch]$Logout,
     [switch]$TryLogin,
+    [switch]$FreshPortalUrl,
+    [switch]$LoginAttempt,
     [string]$PortalUrl = '',
     [switch]$Quiet,
     [switch]$NoHide
@@ -62,7 +64,15 @@ $script:CredPath   = Join-Path $script:RuntimeDir 'credential.dat'
 $script:UserAgent  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
 
 if (-not (Test-Path -LiteralPath $script:RuntimeDir)) {
-    New-Item -ItemType Directory -Force -Path $script:RuntimeDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:RuntimeDir -ErrorAction SilentlyContinue | Out-Null
+}
+
+# 没有数据目录就写不了日志和状态，也没法存凭据。
+# 这时候继续跑只会变成一个看不见、什么也做不了的僵尸进程，所以直接退出。
+if (-not (Test-Path -LiteralPath $script:RuntimeDir)) {
+    Write-Host "无法创建数据目录：$script:RuntimeDir" -ForegroundColor Red
+    Write-Host "请检查该路径的权限，或手动创建后重试。" -ForegroundColor Red
+    exit 1
 }
 
 # 只有常驻模式才隐身；手动跑 -Once / -SelfTest 时要看得见输出
@@ -107,6 +117,8 @@ $script:DefaultConfig = [ordered]@{
     keepaliveFallbackMin    = 5
     keepaliveSec            = 30
     reconnectWindowSec      = 300
+    # 认证页要验证码时，先刷新会话再重试几次（0 = 不刷新，直接等人工）
+    captchaRefreshTries     = 2
     portalHost              = '10.255.240.8'
     portalPort              = 80
 }
@@ -168,6 +180,7 @@ function Get-CredentialPair {
 
 $script:DefaultState = [ordered]@{
     phase               = 'init'
+    pid                 = $null
     portalBase          = $null
     lastNasIp           = $null
     lastQueryString     = $null
@@ -487,6 +500,48 @@ function Get-PortalContext {
 
 # ---------------------------------------------------------------- 认证动作
 
+function Get-FreshPortalUrl {
+    <#
+        重新打开认证入口，换一个"新会话"的地址——等价于在浏览器里按一下 F5。
+
+        背景：ePortal 连续失败多次后，会把验证码绑在当前这个认证会话上；
+        重新打开认证页会拿到新的 queryString / JSESSIONID，验证码要求往往就消失了。
+        这里不识别、也不绕过验证码，只是重新走一遍"打开认证页"这个正常动作。
+    #>
+    $hostName = [string]$script:Config.portalHost
+    $port = [int]$script:Config.portalPort
+    if (-not $hostName) { return $null }
+
+    $candidates = @(
+        ('http://{0}:{1}/eportal/index.jsp' -f $hostName, $port),
+        ('http://{0}/eportal/index.jsp' -f $hostName)
+    ) | Select-Object -Unique
+
+    foreach ($u in $candidates) {
+        try {
+            $req = New-PortalRequest -Url $u -Method 'GET'
+            $res = Read-HttpResult $req
+            if ($res.Error) { continue }
+
+            if ($res.Location) {
+                $loc = [string]$res.Location
+                if ($loc -match '^(?i)http') { return $loc }
+                if ($loc.StartsWith('/')) { return ('http://{0}{1}' -f $hostName, $loc) }
+            }
+
+            # 有的入口是 JS 跳转，从返回的 HTML 里再找一次
+            if ($res.Content) {
+                $m = [regex]::Match($res.Content, '(?i)(?:location\.(?:href|replace)\s*[=(]\s*|window\.open\s*\(\s*)["'']([^"'']*eportal[^"'']*)["'']')
+                if ($m.Success) {
+                    $val = $m.Groups[1].Value
+                    if ($val -match '^(?i)http') { return $val }
+                }
+            }
+        } catch { }
+    }
+    return $null
+}
+
 function Invoke-PortalLogin {
     param(
         [string]$PortalUrl,
@@ -601,6 +656,61 @@ function Send-Keepalive {
 
 # ---------------------------------------------------------------- Wi-Fi 重连
 
+function Invoke-NativeText {
+    <#
+        捕获原生命令输出并正确解码。
+
+        踩过的坑：netsh 在中文 Windows 上**固定输出 UTF-8**，跟控制台代码页无关
+        （chcp 936 / chcp 65001 都一样）。而 PowerShell 5.1 用 `& netsh 2>&1` 捕获时
+        是按 [Console]::OutputEncoding（通常是 936）解码，于是日志里就出现
+        「宸叉壋鍒╂岃緋」这种乱码。
+
+        这里把输出重定向到临时文件，拿到**原始字节**，先按 UTF-8 严格解码；
+        失败的机器（netsh 真发 GBK 的那种）再退回 OEM 代码页。
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string]$Arguments = ''
+    )
+
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $errFile = [System.IO.Path]::GetTempFileName()
+
+    try {
+        Start-Process -FilePath $FilePath -ArgumentList $Arguments `
+            -WindowStyle Hidden -PassThru -Wait `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile | Out-Null
+
+        $bytes = @()
+        $bytes += [System.IO.File]::ReadAllBytes($outFile)
+        $bytes += [System.IO.File]::ReadAllBytes($errFile)
+
+        if ($bytes.Length -eq 0) { return '' }
+
+        $text = $null
+
+        # 1) 严格 UTF-8（非法字节会抛异常）
+        try {
+            $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+            $text = $strictUtf8.GetString($bytes)
+        } catch {
+            $text = $null
+        }
+
+        # 2) 回退到系统 OEM 代码页
+        if ($null -eq $text) {
+            $oem = [System.Text.Encoding]::GetEncoding(
+                [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+            $text = $oem.GetString($bytes)
+        }
+
+        $text = $text -replace [string][char]0xFEFF, ''
+        return (($text -replace '\s+', ' ').Trim())
+    } finally {
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-WifiInterface {
     $up = $null
     $physical = $null
@@ -635,8 +745,7 @@ function Try-WifiReconnect {
     $ssid = [string]$script:Config.ssid
     Write-Log "Wi-Fi 不在线，尝试重新连接 $ssid" 'WARN'
     try {
-        $out = & netsh wlan connect name="$ssid" 2>&1
-        $text = ($out | Out-String) -replace '\s+', ' '
+        $text = Invoke-NativeText -FilePath 'netsh.exe' -Arguments ('wlan connect name="' + $ssid + '"')
         if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
         Write-Log "netsh wlan connect：$text" 'INFO'
     } catch {
@@ -674,12 +783,12 @@ function Get-NextBackoff {
     return [double]$arr[$i]
 }
 
-function Invoke-LoginAttempt {
+function Invoke-LoginOnce {
     param($State, $Cred, [string]$PortalUrl)
 
-    $verdict = Invoke-PortalLogin -PortalUrl $PortalUrl -User $Cred.User -Pass $Cred.Pass
-    if ($verdict.Result -eq 'Conflict') {
-        Write-Log "认证服务器说会话冲突：$($verdict.Message)，先清旧会话再试一次" 'WARN'
+    $v = Invoke-PortalLogin -PortalUrl $PortalUrl -User $Cred.User -Pass $Cred.Pass
+    if ($v.Result -eq 'Conflict') {
+        Write-Log "认证服务器说会话冲突：$($v.Message)，先清旧会话再试一次" 'WARN'
         $conflictIndex = $State.userIndex
         if (-not $conflictIndex -and $State.lastNasIp) {
             # 没有 userIndex 也能按规则拼一个，专门用来注销掉上次残留的会话
@@ -687,7 +796,43 @@ function Invoke-LoginAttempt {
         }
         Clear-PortalSession -PortalUrl $PortalUrl -User $Cred.User -Pass $Cred.Pass -UserIndex $conflictIndex | Out-Null
         Start-Sleep -Seconds 2
-        $verdict = Invoke-PortalLogin -PortalUrl $PortalUrl -User $Cred.User -Pass $Cred.Pass
+        $v = Invoke-PortalLogin -PortalUrl $PortalUrl -User $Cred.User -Pass $Cred.Pass
+    }
+    return $v
+}
+
+function Invoke-LoginAttempt {
+    param($State, $Cred, [string]$PortalUrl)
+
+    $url = $PortalUrl
+    $verdict = Invoke-LoginOnce -State $State -Cred $Cred -PortalUrl $url
+
+    # 认证页要验证码时，先按"刷新页面"的办法换一个干净会话再试。
+    # 实测：连续失败几次后出现的验证码，重新打开认证页往往就不再要求了。
+    $tries = 0
+    $maxTries = 2
+    try { $maxTries = [int]$script:Config.captchaRefreshTries } catch { }
+    if ($maxTries -lt 0) { $maxTries = 0 }
+
+    while ($verdict.Result -eq 'NeedCaptcha' -and $tries -lt $maxTries) {
+        $tries++
+        Write-Log ("认证页要求验证码，刷新认证页换新会话再试（第 {0}/{1} 次）" -f $tries, $maxTries) 'WARN'
+
+        $fresh = Get-FreshPortalUrl
+        if (-not $fresh) {
+            Write-Log '刷新认证页没拿到新地址，放弃这次自动重试' 'WARN'
+            break
+        }
+
+        $freshCtx = Get-PortalContext -PortalUrl $fresh
+        if ($freshCtx.QueryString) { $State.lastQueryString = $freshCtx.QueryString }
+        if ($freshCtx.QueryString -match '(?:^|&)nasip=([^&]+)') { $State.lastNasIp = $Matches[1] }
+        $State.portalBase = $freshCtx.Base
+        $url = $fresh
+
+        Start-Sleep -Seconds 2
+        Add-LoginStat -State $State -Success $false   # 这也是真实的一次登录请求，要进频率限制
+        $verdict = Invoke-LoginOnce -State $State -Cred $Cred -PortalUrl $url
     }
 
     if ($verdict.Result -eq 'Success') {
@@ -715,7 +860,8 @@ function Invoke-LoginAttempt {
         'NeedCaptcha' {
             $State.phase = 'need-captcha'
             $State.nextAttemptAt = (Get-Date).AddSeconds([int]$script:Config.loginPauseSec).ToString('o')
-            Write-Log "认证页要求验证码，自动登录暂停。请手动打开认证页登录一次。原文：$($verdict.Message)" 'ERROR'
+            $extra = if ($tries -gt 0) { "（已刷新会话 $tries 次仍然要验证码）" } else { "" }
+            Write-Log "认证页要求验证码$extra，自动登录暂停。请手动打开认证页登录一次。原文：$($verdict.Message)" 'ERROR'
         }
         'BadCredential' {
             $State.phase = 'bad-credential'
@@ -743,10 +889,20 @@ function Invoke-Cycle {
     $state = Load-State
     $script:Config = Load-Config
 
+    # 界面暂停：只放一个标志文件，不动计划任务，也不需要管理员权限
+    if (Test-Path -LiteralPath (Join-Path $script:RuntimeDir 'paused.flag')) {
+        if ("$($state.phase)" -ne 'paused') { Write-Log '被界面暂停，从现在起不登录、不保活' 'INFO' }
+        $state.phase = 'paused'
+        $state.lastMessage = '已暂停（界面控制）'
+        Save-State -State $state
+        return 'paused'
+    }
+
     # 自动重连的总时间预算：从第一次发现认证页开始算，用完就停手等人工
+    # reconnectWindowSec 单位是秒；0 = 不限制（一直重试，直到连上或手动暂停）
     $winSec = 300
     try { $winSec = [int]$script:Config.reconnectWindowSec } catch { }
-    if ($winSec -lt 60) { $winSec = 60 }
+    if ($winSec -lt 0) { $winSec = 0 }
 
     $gw = Get-DefaultGateway
     if (-not $gw) {
@@ -929,12 +1085,16 @@ function Invoke-Cycle {
             $nowWin = Get-Date
             if (-not $state.reconnectSince) {
                 $state.reconnectSince = $nowWin.ToString('o')
-                Write-Log ("开始自动重连，预算 {0:N0} 秒" -f $winSec) 'INFO'
+                if ($winSec -gt 0) {
+                    Write-Log ("开始自动重连，预算 {0:N0} 秒" -f $winSec) 'INFO'
+                } else {
+                    Write-Log '开始自动重连，预算不限制（会一直尝试）' 'INFO'
+                }
             }
             $state.onlineSince = $null
             $reElapsed = 0
             try { $reElapsed = ($nowWin - [datetime]::Parse($state.reconnectSince)).TotalSeconds } catch { }
-            if ($reElapsed -ge $winSec) {
+            if ($winSec -gt 0 -and $reElapsed -ge $winSec) {
                 $state.lastMessage = '自动重连已停止，请手动登录一次'
                 Write-PhaseLog -State $state -Phase 'gave-up' -Level 'ERROR' -Message (
                     '已经试了 {0:N0} 秒还没连上，按规则停止自动重连。请手动打开认证页登录一次，登上去之后我会接着保活。' -f $winSec)
@@ -992,7 +1152,7 @@ function Invoke-Cycle {
 # ---------------------------------------------------------------- 单实例
 
 $mutex = $null
-if (-not ($Once -or $Logout -or $TryLogin)) {
+if (-not ($Once -or $Logout -or $TryLogin -or $FreshPortalUrl -or $LoginAttempt -or $SelfTest)) {
     $mutex = New-Object System.Threading.Mutex($false, 'CampusNetGuard-Instance')
     if (-not $mutex.WaitOne(0)) {
         Write-Log '已经有一个守护进程在跑，本次退出' 'WARN'
@@ -1005,12 +1165,14 @@ try {
     $cred = Get-CredentialPair
 
     # 守护进程重启时：上一次的重连预算如果还没过期就接着算，避免靠重启绕过限制
-    if (-not ($Once -or $SelfTest -or $TryLogin -or $Logout)) {
+    if (-not ($Once -or $SelfTest -or $TryLogin -or $Logout -or $FreshPortalUrl -or $LoginAttempt)) {
         try {
             $bootState = Load-State
             if ($bootState.reconnectSince) {
                 $bootAge = ((Get-Date) - [datetime]::Parse($bootState.reconnectSince)).TotalSeconds
-                if ($bootAge -ge [int]$script:Config.reconnectWindowSec) {
+                $bootWin = 0
+                try { $bootWin = [int]$script:Config.reconnectWindowSec } catch { }
+                if ($bootWin -gt 0 -and $bootAge -ge $bootWin) {
                     $bootState.reconnectSince = $null
                     $bootState.onlineSince = $null
                     Save-State -State $bootState
@@ -1029,6 +1191,42 @@ try {
             Write-Host ("网络状态：{0} {1}" -f $net.State, $net.Detail)
             return
         }
+    }
+
+    if ($FreshPortalUrl) {
+        # 排查用：看看"刷新认证页"能拿到什么样的新地址（不发登录请求）
+        $fresh = Get-FreshPortalUrl
+        if ($fresh) {
+            Write-Host '刷新后的认证页地址：'
+            Write-Host ("  {0}" -f ($fresh -split '\?')[0])
+            $ctx = Get-PortalContext -PortalUrl $fresh
+            Write-Host ("  queryString 长度：{0}" -f ($ctx.QueryString.Length))
+            if ($ctx.QueryString -match '(?:^|&)nasip=([^&]+)') { Write-Host ("  nasip：{0}" -f $Matches[1]) }
+        } else {
+            Write-Host '没拿到新地址（可能已经在线，或认证入口不通）。'
+        }
+        return
+    }
+
+    if ($LoginAttempt) {
+        # 排查用：完整跑一遍"登录 + 验证码刷新会话"的流程（会真的发登录请求）
+        if (-not $cred) {
+            Write-Host '还没有可用凭据，先运行 install.cmd。'
+            return
+        }
+        if (-not $PortalUrl) {
+            Write-Host '用法：guard.ps1 -LoginAttempt -PortalUrl "http://10.255.240.8/eportal/index.jsp?..."'
+            return
+        }
+        $st = Load-State
+        Write-Host ("认证页：{0}" -f ($PortalUrl -split '\?')[0])
+        Write-Host ("账号：{0}" -f $cred.User)
+        $ok = Invoke-LoginAttempt -State $st -Cred $cred -PortalUrl $PortalUrl
+        Write-Host ("结果：{0}" -f $(if ($ok) { '成功' } else { '失败' }))
+        Write-Host ("阶段：{0}" -f $st.phase)
+        Write-Host ("消息：{0}" -f $st.lastMessage)
+        if ($st.userIndex) { Write-Host ("userIndex：{0}" -f $st.userIndex) }
+        return
     }
 
     if ($TryLogin) {
@@ -1115,6 +1313,11 @@ try {
     }
 
     Write-Log ("守护进程启动，轮询间隔 {0} 秒" -f $script:Config.pollIntervalSec) 'INFO'
+    try {
+        $bootStateForUi = Load-State
+        $bootStateForUi.pid = $PID
+        Save-State -State $bootStateForUi
+    } catch { }
     try {
         $me = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
         $parentName = ''
